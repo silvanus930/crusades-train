@@ -201,7 +201,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     if num_gpus > 1:
         model = DDP(
             model,
-            device_ids=[device.index],
+            device_ids=[device.index if device.index is not None else torch.cuda.current_device()],
             gradient_as_bucket_view=True,
             bucket_cap_mb=700,
             broadcast_buffers=False,
@@ -227,7 +227,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             lr=1e-4,
             weight_decay=0.1,
             betas=(0.9, 0.95),
-            fused=True,
+            fused=(device.type == "cuda"),
         )
 
     all_micro_inputs = []
