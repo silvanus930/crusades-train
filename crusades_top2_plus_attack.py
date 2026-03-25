@@ -56,7 +56,7 @@ class InnerStepsResult:
 
 
 _PREPARED = set()
-_STATE_OVERLAP_STEPS = 1
+_STATE_OVERLAP_STEPS = 2
 _RUN_IDX = 0
 
 
@@ -75,6 +75,11 @@ def _prepare_model(model):
             model.config.output_hidden_states = False
         if hasattr(model.config, "output_attentions"):
             model.config.output_attentions = False
+    if hasattr(model, "gradient_checkpointing_disable"):
+        try:
+            model.gradient_checkpointing_disable()
+        except Exception:
+            pass
 
 
 def _get_wrap_policy(model):
@@ -99,11 +104,20 @@ def _gather_fsdp_state(model, device):
 
 
 def _gather_plain_state(model):
-    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if rank != 0:
+        return None
+    sd = model.state_dict()
+    pinned = {k: torch.empty_like(v, device="cpu").pin_memory() for k, v in sd.items()}
+    for k, v in sd.items():
+        pinned[k].copy_(v, non_blocking=True)
+    return pinned
 
 
 def _finish_state(model, device, is_fsdp):
-    return _gather_fsdp_state(model, device) if is_fsdp else _gather_plain_state(model)
+    state = _gather_fsdp_state(model, device) if is_fsdp else _gather_plain_state(model)
+    torch.cuda.synchronize(device)
+    return state
 
 
 def _collect_state(ctx):
@@ -185,6 +199,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             mixed_precision=mp_policy,
             device_id=device,
             use_orig_params=True,
+            forward_prefetch=True,
+            limit_all_gathers=True,
         )
     else:
         model = model.to(device)
@@ -219,7 +235,7 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         return model(input_ids).logits
 
     try:
-        compiled_fwd = torch.compile(fwd_only, mode="reduce-overhead", dynamic=False)
+        compiled_fwd = torch.compile(fwd_only, mode="reduce-overhead", dynamic=False, fullgraph=False)
         logits = compiled_fwd(all_inputs[0])
     except Exception:
         try:
