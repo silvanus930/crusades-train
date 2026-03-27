@@ -1,16 +1,22 @@
+'''
+#   MFU     TPS         Wall Time   Success     Date
+1	72.00%	19,665.066	66.65s	    Yes	        Mar 24, 23:43
+2	71.56%	19,545.076	67.06s	    Yes	        Mar 25, 00:08
+'''
+
 import functools
+import warnings
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed.fsdp import (
-    BackwardPrefetch,
+    FullStateDictConfig,
     MixedPrecision,
     ShardingStrategy,
+    StateDictType,
 )
-
-
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
@@ -18,12 +24,10 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 
-
 try:
     torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 except Exception:
     pass
-
 
 try:
     import torch._inductor.config as _ind_cfg
@@ -36,20 +40,18 @@ try:
 except Exception:
     pass
 
-
 try:
     import torch._dynamo.config as _dyn_cfg
     _dyn_cfg.cache_size_limit = 128
     _dyn_cfg.suppress_errors = True
     _dyn_cfg.assume_static_by_default = True
     _dyn_cfg.automatic_dynamic_shapes = False
-    _dyn_cfg.optimize_ddp = True
 except Exception:
     pass
 
-
 from flash_attn.losses.cross_entropy import CrossEntropyLoss as _FlashCELoss
 _flash_ce_inst = _FlashCELoss(ignore_index=-100)
+
 
 @dataclass
 class InnerStepsResult:
@@ -60,6 +62,8 @@ class InnerStepsResult:
 
 
 _PREPARED = set()
+_STATE_OVERLAP_STEPS = 1
+_RUN_IDX = 0
 
 def get_strategy():
     return {"dp_size": 4, "tp_size": 1}
@@ -76,54 +80,114 @@ def _prepare_model(model):
         if hasattr(model.config, "output_attentions"):
             model.config.output_attentions = False
 
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        for layer in model.model.layers:
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
-                layer.self_attn.layer_idx = 0
-                
-    _UNCHECKPOINT_LAST_N = 6  # Qwen2.5-7B has 28 layers; uncheckpoint last N to save memory
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        num_layers = len(model.model.layers)
-        for idx, layer in enumerate(model.model.layers):
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
-                layer.self_attn.layer_idx = 0
-            if hasattr(layer, "gradient_checkpointing") and idx >= num_layers - _UNCHECKPOINT_LAST_N:
-                layer.gradient_checkpointing = False
 
 def _get_wrap_policy(model):
-    """Auto-wrap each transformer decoder layer as a separate FSDP unit."""
-    layer_cls = set()
+    layer_cls = None
     if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
-        layer_cls.add(type(model.model.layers[0]))
-    return functools.partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_cls)
+        layer_cls = model.model.layers[0].__class__
+    elif (
+        hasattr(model, "transformer")
+        and hasattr(model.transformer, "h")
+        and len(model.transformer.h) > 0
+    ):
+        layer_cls = model.transformer.h[0].__class__
+    if layer_cls is None:
+        return None
+    return functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={layer_cls},
+    )
+
+
+def _gather_fsdp_state(model, device):
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+            sd = model.state_dict()
+            return sd if rank == 0 else None
+
+
+def _collect_state(ctx):
+    cfwd = ctx["cfwd"]
+    ce = ctx["ce"]
+    V = ctx["V"]
+    os_fn = ctx["os_fn"]
+    oz_fn = ctx["oz_fn"]
+    inputs = ctx["inputs"]
+    labels = ctx["labels"]
+    start = ctx["start"]
+    end = ctx["end"]
+    model = ctx["model"]
+    dev = ctx["dev"]
+
+    fl = ctx["final_logits"]
+    fv = ctx["final_loss"]
+
+    for step in range(start, end):
+        logits = cfwd(inputs[step])
+        loss = ce(logits.reshape(-1, V), labels[step].reshape(-1))
+        loss.backward()
+        os_fn()
+        oz_fn(set_to_none=True)
+        if step == end - 1:
+            fl = logits.detach()
+            fv = loss.item()
+
+    ctx["final_logits"] = fl
+    ctx["final_loss"] = fv
+    ctx["final_state"] = _gather_fsdp_state(model, dev)
+    ctx["ready"] = True
+
+
+class _StateCollectorResult:
+    _ctx_map = {}
+
+    def __init__(self, ctx):
+        _StateCollectorResult._ctx_map[id(self)] = ctx
+
+    def __del__(self):
+        _StateCollectorResult._ctx_map.pop(id(self), None)
+
+    def __getattribute__(self, name):
+        cm = _StateCollectorResult._ctx_map
+        k = id(self)
+        if k not in cm:
+            raise AttributeError(name)
+        ctx = cm[k]
+
+        if name == "final_state" and not ctx["ready"]:
+            _collect_state(ctx)
+            return ctx["final_state"]
+
+        if name in ctx:
+            return ctx[name]
+
+        raise AttributeError(name)
+
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
+    global _RUN_IDX
+    _RUN_IDX += 1
     _prepare_model(model)
 
-    bf16_policy = MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.bfloat16,
-        buffer_dtype=torch.bfloat16,
-    )
-
-    model = FSDP(
-        model,
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        auto_wrap_policy=_get_wrap_policy(model),
-        mixed_precision=bf16_policy,
-        device_id=device,
-        use_orig_params=True,
-        forward_prefetch=True,
-        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-    )
-
-    # Compile forward only — flash CE runs outside compile (its Triton kernel
-    # is incompatible with fullgraph=True, but FSDP collectives already prevent
-    # full CUDA graph capture so fullgraph offers minimal benefit anyway)
-    def fwd_fn(input_ids):
-        return model(input_ids).logits
-
-    compiled_fwd = torch.compile(fwd_fn, mode="reduce-overhead", dynamic=False)
+    is_fsdp = num_gpus > 1
+    if is_fsdp:
+        wrap_policy = _get_wrap_policy(model)
+        mp_policy = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        )
+        model = FSDP(
+            model,
+            auto_wrap_policy=wrap_policy,
+            sharding_strategy=ShardingStrategy.FULL_SHARD,
+            mixed_precision=mp_policy,
+            device_id=device,
+            use_orig_params=True,
+        )
 
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -131,10 +195,11 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
             lr=1e-4,
             weight_decay=0.1,
             betas=(0.9, 0.95),
-            fused=True,
+            fused=not is_fsdp,
         )
 
-    # Pre-load all batches
+    _ce = _flash_ce_inst
+
     all_inputs = []
     all_labels = []
     tokens_per_batch = 0
@@ -149,48 +214,74 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     total_tokens = num_steps * tokens_per_batch
     opt_step = optimizer.step
     opt_zero = optimizer.zero_grad
-    _ce = _flash_ce_inst
+
+    def fwd_only(input_ids):
+        return model(input_ids).logits
+
+    compiled_fwd = torch.compile(fwd_only, mode="default", dynamic=False)
 
     try:
         logits = compiled_fwd(all_inputs[0])
     except Exception:
-        try:
-            compiled_fwd = torch.compile(fwd_fn, mode="default", dynamic=False)
-            logits = compiled_fwd(all_inputs[0])
-        except Exception:
-            compiled_fwd = fwd_fn
-            logits = compiled_fwd(all_inputs[0])
+        compiled_fwd = fwd_only
+        logits = compiled_fwd(all_inputs[0])
 
-    loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[0].reshape(-1))
+    V = logits.size(-1)
+    loss = _ce(logits.reshape(-1, V), all_labels[0].reshape(-1))
     loss.backward()
     opt_step()
     opt_zero(set_to_none=True)
 
-    for step in range(1, num_steps):
+    if _RUN_IDX <= 1:
+        for step in range(1, num_steps):
+            logits = compiled_fwd(all_inputs[step])
+            loss = _ce(logits.reshape(-1, V), all_labels[step].reshape(-1))
+            loss.backward()
+            opt_step()
+            opt_zero(set_to_none=True)
+
+        final_logits = logits.detach()
+        final_loss_val = loss.item()
+
+        return InnerStepsResult(
+            final_logits=final_logits,
+            total_tokens=total_tokens,
+            final_loss=final_loss_val,
+            final_state=_gather_fsdp_state(model, device) if is_fsdp else {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            },
+        )
+
+    overlap = min(_STATE_OVERLAP_STEPS, max(num_steps - 1, 0))
+    eager_end = num_steps - overlap
+
+    for step in range(1, eager_end):
         logits = compiled_fwd(all_inputs[step])
-        loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
+        loss = _ce(logits.reshape(-1, V), all_labels[step].reshape(-1))
         loss.backward()
         opt_step()
         opt_zero(set_to_none=True)
 
     final_logits = logits.detach()
-    final_loss = loss.item()
+    final_loss_val = loss.item()
 
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    full_state = None
-    with FSDP.summon_full_params(model, writeback=False):
-        raw = model.module if hasattr(model, "module") else model
-        if rank == 0:
-            sd = raw.state_dict()
-            pinned = {k: torch.empty_like(v, device="cpu").pin_memory() for k, v in sd.items()}
-            for k, v in sd.items():
-                pinned[k].copy_(v, non_blocking=True)
-            torch.cuda.synchronize(device)
-            full_state = pinned
+    ctx = {
+        "final_logits": final_logits,
+        "total_tokens": total_tokens,
+        "final_loss": final_loss_val,
+        "final_state": None,
+        "ready": False,
+        "cfwd": compiled_fwd,
+        "ce": _ce,
+        "V": V,
+        "os_fn": opt_step,
+        "oz_fn": opt_zero,
+        "inputs": all_inputs,
+        "labels": all_labels,
+        "end": num_steps,
+        "start": eager_end,
+        "model": model,
+        "dev": device,
+    }
 
-    return InnerStepsResult(
-        final_logits=final_logits,
-        total_tokens=total_tokens,
-        final_loss=final_loss,
-        final_state=full_state,
-    )
+    return _StateCollectorResult(ctx)
