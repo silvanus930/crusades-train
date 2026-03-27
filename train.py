@@ -1,8 +1,3 @@
-'''
-#   MFU     TPS         Wall Time   Success     Date
-1	72.00%	19,665.066	66.65s	    Yes	        Mar 24, 23:43
-2	71.56%	19,545.076	67.06s	    Yes	        Mar 25, 00:08
-'''
 
 import functools
 import warnings
