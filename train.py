@@ -3,9 +3,15 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from torch.distributed.fsdp import BackwardPrefetch, MixedPrecision, ShardingStrategy
+import torch.nn.functional as F
+from torch.distributed.fsdp import (
+    BackwardPrefetch,
+    MixedPrecision,
+    ShardingStrategy,
+)
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -15,28 +21,31 @@ try:
     torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 except Exception:
     pass
+
 try:
-    import torch._inductor.config as _ic
-    _ic.coordinate_descent_tuning = True
-    _ic.triton.unique_kernel_names = True
-    _ic.fx_graph_cache = True
-    _ic.triton.cudagraph_trees = True
-    _ic.epilogue_fusion = True
-    _ic.shape_padding = True
+    import torch._inductor.config as _ind_cfg
+    _ind_cfg.coordinate_descent_tuning = True
+    _ind_cfg.triton.unique_kernel_names = True
+    _ind_cfg.fx_graph_cache = True
+    _ind_cfg.triton.cudagraph_trees = True
+    _ind_cfg.epilogue_fusion = True
+    _ind_cfg.shape_padding = True
 except Exception:
     pass
+
 try:
-    import torch._dynamo.config as _dc
-    _dc.cache_size_limit = 128
-    _dc.suppress_errors = True
-    _dc.assume_static_by_default = True
-    _dc.automatic_dynamic_shapes = False
-    _dc.optimize_ddp = True
+    import torch._dynamo.config as _dyn_cfg
+    _dyn_cfg.cache_size_limit = 128
+    _dyn_cfg.suppress_errors = True
+    _dyn_cfg.assume_static_by_default = True
+    _dyn_cfg.automatic_dynamic_shapes = False
+    _dyn_cfg.optimize_ddp = True
 except Exception:
     pass
 
 from flash_attn.losses.cross_entropy import CrossEntropyLoss as _FlashCELoss
-_fce = _FlashCELoss(ignore_index=-100)
+_flash_ce_inst = _FlashCELoss(ignore_index=-100)
+
 
 @dataclass
 class InnerStepsResult:
@@ -45,93 +54,119 @@ class InnerStepsResult:
     final_loss: float
     final_state: dict | None = None
 
-_prepared_ids = set()
+
+_PREPARED = set()
+
+_UNCHECKPOINT_LAST_N = 15
+
+
 def get_strategy():
     return {"dp_size": 4, "tp_size": 1}
 
-def _prep(mod):
-    if id(mod) in _prepared_ids:
+
+def _prepare_model(model):
+    mid = id(model)
+    if mid in _PREPARED:
         return
-    _prepared_ids.add(id(mod))
-    if hasattr(mod, "config"):
-        mod.config.use_cache = False
-    tail_keep = 10
-    if hasattr(mod, "model") and hasattr(mod.model, "layers"):
-        n_layers = len(mod.model.layers)
-        for idx, layer in enumerate(mod.model.layers):
+    _PREPARED.add(mid)
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+        if hasattr(model.config, "output_hidden_states"):
+            model.config.output_hidden_states = False
+        if hasattr(model.config, "output_attentions"):
+            model.config.output_attentions = False
+
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        num_layers = len(model.model.layers)
+        num_ckpt_layers = num_layers - _UNCHECKPOINT_LAST_N
+
+        for idx, layer in enumerate(model.model.layers):
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
                 layer.self_attn.layer_idx = 0
-            if hasattr(layer, "gradient_checkpointing") and idx >= n_layers - tail_keep:
+            if hasattr(layer, "gradient_checkpointing") and idx >= num_ckpt_layers:
                 layer.gradient_checkpointing = False
 
-def _wp(mod):
-    wrap_classes = set()
-    if hasattr(mod, "model") and hasattr(mod.model, "layers") and len(mod.model.layers) > 0:
-        wrap_classes.add(type(mod.model.layers[0]))
-    return functools.partial(transformer_auto_wrap_policy, transformer_layer_cls=wrap_classes)
+
+def _get_wrap_policy(model):
+    """Auto-wrap each transformer decoder layer as a separate FSDP unit."""
+    layer_cls = set()
+    if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
+        layer_cls.add(type(model.model.layers[0]))
+    return functools.partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_cls)
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
-    _prep(model)
-    mixed_precision = MixedPrecision(
-        param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16
+    _prepare_model(model)
+
+    bf16_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
     )
+
     model = FSDP(
         model,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
-        auto_wrap_policy=_wp(model),
-        mixed_precision=mixed_precision,
+        auto_wrap_policy=_get_wrap_policy(model),
+        mixed_precision=bf16_policy,
         device_id=device,
         use_orig_params=True,
         forward_prefetch=True,
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
     )
-    logits_fn = torch.compile(lambda x: model(x).logits, mode="reduce-overhead", dynamic=False)
+
+    def fwd_fn(input_ids):
+        return model(input_ids).logits
+    compiled_fwd = torch.compile(fwd_fn, mode="default", dynamic=False)
     if optimizer is None:
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=1e-4, weight_decay=0.1, betas=(0.9, 0.95), fused=True
+            model.parameters(),
+            lr=1e-4,
+            weight_decay=0.1,
+            betas=(0.9, 0.95),
+            fused=True,
         )
-    inputs_seq, targets_seq = [], []
-    n_tokens_batch = 0
+
+    all_inputs = []
+    all_labels = []
+    tokens_per_batch = 0
     for _ in range(num_steps):
         batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
-        inputs_seq.append(batch[:, :-1].contiguous())
-        targets_seq.append(batch[:, 1:].contiguous())
-        n_tokens_batch = batch.numel()
+        all_inputs.append(batch[:, :-1].contiguous())
+        all_labels.append(batch[:, 1:].contiguous())
+        tokens_per_batch = batch.numel()
+
     torch.cuda.synchronize(device)
-    token_total = num_steps * n_tokens_batch
-    step, zero_grad, ce = optimizer.step, optimizer.zero_grad, _fce
-    try:
-        logits = logits_fn(inputs_seq[0])
-    except Exception:
-        try:
-            logits_fn = torch.compile(lambda x: model(x).logits, mode="default", dynamic=False)
-            logits = logits_fn(inputs_seq[0])
-        except Exception:
-            logits_fn = lambda x: model(x).logits
-            logits = logits_fn(inputs_seq[0])
-    vocab = logits.size(-1)
-    loss = ce(logits.reshape(-1, vocab), targets_seq[0].reshape(-1))
-    loss.backward()
-    step()
-    zero_grad(set_to_none=True)
-    for step_idx in range(1, num_steps):
-        logits = logits_fn(inputs_seq[step_idx])
-        loss = ce(logits.reshape(-1, vocab), targets_seq[step_idx].reshape(-1))
+
+    total_tokens = num_steps * tokens_per_batch
+    opt_step = optimizer.step
+    opt_zero = optimizer.zero_grad
+    _ce = _flash_ce_inst
+    
+    for step in range(num_steps):
+        logits = compiled_fwd(all_inputs[step])
+        loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
         loss.backward()
-        step()
-        zero_grad(set_to_none=True)
-    logits_final, loss_val = logits.detach(), loss.item()
+        opt_step()
+        opt_zero(set_to_none=True)
+
+    final_logits = logits.detach()
+    final_loss = loss.item()
+
     rank = dist.get_rank() if dist.is_initialized() else 0
-    cpu_state = None
+    full_state = None
     with FSDP.summon_full_params(model, writeback=False):
-        unwrapped = model.module if hasattr(model, "module") else model
+        raw = model.module if hasattr(model, "module") else model
         if rank == 0:
-            state_dict = unwrapped.state_dict()
-            pinned = {k: torch.empty_like(v, device="cpu").pin_memory() for k, v in state_dict.items()}
-            for k, v in state_dict.items():
+            sd = raw.state_dict()
+            pinned = {k: torch.empty_like(v, device="cpu").pin_memory() for k, v in sd.items()}
+            for k, v in sd.items():
                 pinned[k].copy_(v, non_blocking=True)
             torch.cuda.synchronize(device)
-            cpu_state = pinned
+            full_state = pinned
+
     return InnerStepsResult(
-        final_logits=logits_final, total_tokens=token_total, final_loss=loss_val, final_state=cpu_state
+        final_logits=final_logits,
+        total_tokens=total_tokens,
+        final_loss=final_loss,
+        final_state=full_state,
     )
