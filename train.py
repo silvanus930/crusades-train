@@ -3,7 +3,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch.distributed.fsdp import (
     BackwardPrefetch,
     MixedPrecision,
@@ -57,7 +56,8 @@ class InnerStepsResult:
 
 _PREPARED = set()
 
-_UNCHECKPOINT_LAST_N = 15
+# Last N blocks run without activation checkpointing (faster; needs enough VRAM).
+_UNCHECKPOINT_LAST_N = 18
 
 
 def get_strategy():
@@ -94,6 +94,13 @@ def _get_wrap_policy(model):
         layer_cls.add(type(model.model.layers[0]))
     return functools.partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_cls)
 
+
+def _cudagraph_step_begin() -> None:
+    fn = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
+    if fn is not None:
+        fn()
+
+
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     _prepare_model(model)
 
@@ -116,7 +123,8 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     def fwd_fn(input_ids):
         return model(input_ids).logits
-    compiled_fwd = torch.compile(fwd_fn, mode="default", dynamic=False)
+
+    compiled_fwd = torch.compile(fwd_fn, mode="reduce-overhead", dynamic=False)
     if optimizer is None:
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -141,10 +149,30 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
     opt_step = optimizer.step
     opt_zero = optimizer.zero_grad
     _ce = _flash_ce_inst
-    
-    for step in range(num_steps):
+
+    try:
+        _cudagraph_step_begin()
+        logits = compiled_fwd(all_inputs[0])
+    except Exception:
+        try:
+            compiled_fwd = torch.compile(fwd_fn, mode="default", dynamic=False)
+            _cudagraph_step_begin()
+            logits = compiled_fwd(all_inputs[0])
+        except Exception:
+            compiled_fwd = fwd_fn
+            _cudagraph_step_begin()
+            logits = compiled_fwd(all_inputs[0])
+
+    vocab = logits.size(-1)
+    loss = _ce(logits.reshape(-1, vocab), all_labels[0].reshape(-1))
+    loss.backward()
+    opt_step()
+    opt_zero(set_to_none=True)
+
+    for step in range(1, num_steps):
+        _cudagraph_step_begin()
         logits = compiled_fwd(all_inputs[step])
-        loss = _ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
+        loss = _ce(logits.reshape(-1, vocab), all_labels[step].reshape(-1))
         loss.backward()
         opt_step()
         opt_zero(set_to_none=True)
