@@ -11,7 +11,6 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
-
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
@@ -56,19 +55,16 @@ class InnerStepsResult:
 
 _PREPARED = set()
 
-# Match validated baseline: last N blocks skip activation checkpointing (VRAM tradeoff).
-_UNCHECKPOINT_LAST_N = 15
-
 
 def get_strategy():
     return {"dp_size": 4, "tp_size": 1}
-
 
 def _prepare_model(model):
     mid = id(model)
     if mid in _PREPARED:
         return
     _PREPARED.add(mid)
+
     if hasattr(model, "config"):
         model.config.use_cache = False
         if hasattr(model.config, "output_hidden_states"):
@@ -76,29 +72,36 @@ def _prepare_model(model):
         if hasattr(model.config, "output_attentions"):
             model.config.output_attentions = False
 
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        num_layers = len(model.model.layers)
-        num_ckpt_layers = num_layers - _UNCHECKPOINT_LAST_N
+    if hasattr(model, "gradient_checkpointing_disable"):
+        try:
+            model.gradient_checkpointing_disable()
+        except Exception:
+            pass
 
-        for idx, layer in enumerate(model.model.layers):
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        for layer in model.model.layers:
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "layer_idx"):
+                # Same trick as the top files to avoid some graph instability.
                 layer.self_attn.layer_idx = 0
-            if hasattr(layer, "gradient_checkpointing") and idx >= num_ckpt_layers:
+            if hasattr(layer, "gradient_checkpointing"):
                 layer.gradient_checkpointing = False
 
 
 def _get_wrap_policy(model):
-    """Auto-wrap each transformer decoder layer as a separate FSDP unit."""
     layer_cls = set()
     if hasattr(model, "model") and hasattr(model.model, "layers") and len(model.model.layers) > 0:
         layer_cls.add(type(model.model.layers[0]))
     return functools.partial(transformer_auto_wrap_policy, transformer_layer_cls=layer_cls)
 
 
-def _cudagraph_step_begin() -> None:
-    fn = getattr(torch.compiler, "cudagraph_mark_step_begin", None)
-    if fn is not None:
-        fn()
+def _maybe_compile_fwd(model):
+    def fwd_fn(input_ids):
+        return model(input_ids).logits
+
+    try:
+        return torch.compile(fwd_fn, mode="default", dynamic=False)
+    except Exception:
+        return fwd_fn
 
 
 def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
@@ -112,20 +115,18 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     model = FSDP(
         model,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         auto_wrap_policy=_get_wrap_policy(model),
         mixed_precision=bf16_policy,
         device_id=device,
         use_orig_params=True,
         forward_prefetch=True,
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        limit_all_gathers=True,
     )
 
-    def fwd_fn(input_ids):
-        return model(input_ids).logits
+    compiled_fwd = _maybe_compile_fwd(model)
 
-    # "default" compile matches the known-good path; eager fallback if compile fails.
-    compiled_fwd = torch.compile(fwd_fn, mode="default", dynamic=False)
     if optimizer is None:
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -137,44 +138,32 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
 
     all_inputs = []
     all_labels = []
-    tokens_per_batch = 0
+    total_tokens = 0
+
     for _ in range(num_steps):
         batch = next(data_iterator).to(device, dtype=torch.long, non_blocking=True)
-        all_inputs.append(batch[:, :-1].contiguous())
-        all_labels.append(batch[:, 1:].contiguous())
-        tokens_per_batch = batch.numel()
+        inp = batch[:, :-1].contiguous()
+        lbl = batch[:, 1:].contiguous()
+        all_inputs.append(inp)
+        all_labels.append(lbl)
+        total_tokens += batch.numel()
 
-    torch.cuda.synchronize(device)
-
-    total_tokens = num_steps * tokens_per_batch
     opt_step = optimizer.step
     opt_zero = optimizer.zero_grad
-    _ce = _flash_ce_inst
+    ce = _flash_ce_inst
 
-    try:
-        _cudagraph_step_begin()
-        logits = compiled_fwd(all_inputs[0])
-    except Exception:
-        compiled_fwd = fwd_fn
-        _cudagraph_step_begin()
-        logits = compiled_fwd(all_inputs[0])
+    logits = None
+    loss = None
 
-    vocab = logits.size(-1)
-    loss = _ce(logits.reshape(-1, vocab), all_labels[0].reshape(-1))
-    loss.backward()
-    opt_step()
-    opt_zero(set_to_none=True)
-
-    for step in range(1, num_steps):
-        _cudagraph_step_begin()
+    for step in range(num_steps):
         logits = compiled_fwd(all_inputs[step])
-        loss = _ce(logits.reshape(-1, vocab), all_labels[step].reshape(-1))
+        loss = ce(logits.reshape(-1, logits.size(-1)), all_labels[step].reshape(-1))
         loss.backward()
         opt_step()
         opt_zero(set_to_none=True)
 
     final_logits = logits.detach()
-    final_loss = loss.item()
+    final_loss = float(loss.item())
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     full_state = None
@@ -182,11 +171,10 @@ def inner_steps(model, data_iterator, optimizer, num_steps, device, num_gpus=1):
         raw = model.module if hasattr(model, "module") else model
         if rank == 0:
             sd = raw.state_dict()
-            pinned = {k: torch.empty_like(v, device="cpu").pin_memory() for k, v in sd.items()}
-            for k, v in sd.items():
-                pinned[k].copy_(v, non_blocking=True)
-            torch.cuda.synchronize(device)
-            full_state = pinned
+            full_state = {
+                k: v.detach().to(device="cpu", copy=True)
+                for k, v in sd.items()
+            }
 
     return InnerStepsResult(
         final_logits=final_logits,
